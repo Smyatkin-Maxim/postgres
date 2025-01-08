@@ -547,6 +547,7 @@ int			tcp_keepalives_interval;
 int			tcp_keepalives_count;
 int			tcp_user_timeout;
 
+extern bool gp_enable_runtime_filter_pushdown;
 /*
  * SSL renegotiation was been removed in PostgreSQL 9.5, but we tolerate it
  * being set to zero (meaning never renegotiate) for backward compatibility.
@@ -769,6 +770,16 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 
 struct config_bool ConfigureNamesBool[] =
 {
+	{
+		{"gp_enable_runtime_filter_pushdown", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Try to push the hash table of hash join to the seqscan or AM as bloom filter."),
+			NULL
+		},
+		&gp_enable_runtime_filter_pushdown,
+		false,
+		NULL, NULL, NULL
+	},
+
 	{
 		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of sequential-scan plans."),

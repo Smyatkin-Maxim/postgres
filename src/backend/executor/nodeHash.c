@@ -79,7 +79,12 @@ static bool ExecParallelHashTuplePrealloc(HashJoinTable hashtable,
 										  size_t size);
 static void ExecParallelHashMergeCounters(HashJoinTable hashtable);
 static void ExecParallelHashCloseBatchAccessors(HashJoinTable hashtable);
+static void BuildRuntimeFilter(HashState *node, TupleTableSlot *slot);
+static void PushdownRuntimeFilter(HashState *node);
+static void FreeRuntimeFilter(HashState *node);
+static void ResetRuntimeFilter(HashState *node);
 
+extern bool gp_enable_runtime_filter_pushdown;
 
 /* ----------------------------------------------------------------
  *		ExecHash
@@ -164,7 +169,15 @@ MultiExecPrivateHash(HashState *node)
 
 		slot = ExecProcNode(outerNode);
 		if (TupIsNull(slot))
+		{
+			if (gp_enable_runtime_filter_pushdown && node->filters)
+				PushdownRuntimeFilter(node);
 			break;
+		}
+
+		if (gp_enable_runtime_filter_pushdown && node->filters)
+			BuildRuntimeFilter(node, slot);
+
 		/* We have to compute the hash value */
 		econtext->ecxt_outertuple = slot;
 
@@ -433,6 +446,8 @@ ExecEndHash(HashState *node)
 	 */
 	outerPlan = outerPlanState(node);
 	ExecEndNode(outerPlan);
+	if (gp_enable_runtime_filter_pushdown && node->filters)
+		FreeRuntimeFilter(node);
 }
 
 
@@ -3495,4 +3510,143 @@ get_hash_memory_limit(void)
 	mem_limit = Min(mem_limit, (double) SIZE_MAX);
 
 	return (size_t) mem_limit;
+}
+
+/*
+ * Convert AttrFilter to ScanKeyData and send these runtime filters to the
+ * target node(seqscan).
+ */
+void
+PushdownRuntimeFilter(HashState *node)
+{
+	ListCell	*lc;
+	List		*scankeys;
+	ScanKey		sk;
+	AttrFilter	*attr_filter;
+
+	foreach (lc, node->filters)
+	{
+		scankeys = NIL;
+
+		attr_filter = lfirst(lc);
+		if (!IsA(attr_filter->target, SeqScanState) || attr_filter->empty)
+			continue;
+
+		/* bloom filter */
+		sk = (ScanKey)palloc0(sizeof(ScanKeyData));
+		sk->sk_flags    = SK_BLOOM_FILTER;
+		sk->sk_attno    = attr_filter->lattno;
+		sk->sk_subtype  = INT8OID;
+		sk->sk_argument = PointerGetDatum(attr_filter->blm_filter);
+		scankeys = lappend(scankeys, sk);
+
+		/* range filter */
+		sk = (ScanKey)palloc0(sizeof(ScanKeyData));
+		sk->sk_flags    = 0;
+		sk->sk_attno    = attr_filter->lattno;
+		sk->sk_strategy = BTGreaterEqualStrategyNumber;
+		sk->sk_subtype  = INT8OID;
+		sk->sk_argument = attr_filter->min;
+		scankeys = lappend(scankeys, sk);
+
+		sk = (ScanKey)palloc0(sizeof(ScanKeyData));
+		sk->sk_flags    = 0;
+		sk->sk_attno    = attr_filter->lattno;
+		sk->sk_strategy = BTLessEqualStrategyNumber;
+		sk->sk_subtype  = INT8OID;
+		sk->sk_argument = attr_filter->max;
+		scankeys = lappend(scankeys, sk);
+
+		/* append new runtime filters to target node */
+		SeqScanState *sss = castNode(SeqScanState, attr_filter->target);
+		sss->filters = list_concat(sss->filters, scankeys);
+			}
+}
+
+static void
+BuildRuntimeFilter(HashState *node, TupleTableSlot *slot)
+{
+	Datum val;
+	bool  isnull;
+	ListCell	*lc;
+	AttrFilter	*attr_filter;
+
+	foreach (lc, node->filters)
+	{
+		attr_filter = (AttrFilter *) lfirst(lc);
+
+		val = slot_getattr(slot, attr_filter->rattno, &isnull);
+		if (isnull)
+			continue;
+
+		attr_filter->empty = false;
+
+		if ((int64_t)val < (int64_t)attr_filter->min)
+			attr_filter->min = val;
+
+		if ((int64_t)val > (int64_t)attr_filter->max)
+			attr_filter->max = val;
+
+		if (attr_filter->blm_filter)
+			bloom_add_element(attr_filter->blm_filter, (unsigned char *)&val, sizeof(Datum));
+	}
+}
+
+void
+FreeRuntimeFilter(HashState *node)
+{
+	ListCell	*lc;
+	AttrFilter	*attr_filter;
+
+	if (!node->filters)
+		return;
+
+	foreach (lc, node->filters)
+	{
+		attr_filter = lfirst(lc);
+		if (attr_filter->blm_filter)
+			bloom_free(attr_filter->blm_filter);
+	}
+
+	list_free_deep(node->filters);
+	node->filters = NIL;
+}
+
+void
+ResetRuntimeFilter(HashState *node)
+{
+	ListCell		*lc;
+	AttrFilter		*attr_filter;
+	SeqScanState	*sss;
+
+	if (!node->filters)
+		return;
+
+	foreach (lc, node->filters)
+	{
+		attr_filter = lfirst(lc);
+		attr_filter->empty  = true;
+
+		if (IsA(attr_filter->target, SeqScanState))
+		{
+			sss = castNode(SeqScanState, attr_filter->target);
+			if (sss->filters)
+			{
+				list_free_deep(sss->filters);
+				sss->filters = NIL;
+			}
+		}
+
+		if (attr_filter->blm_filter)
+			bloom_free(attr_filter->blm_filter);
+
+		attr_filter->blm_filter = bloom_create_aggresive(node->ps.plan->plan_rows,
+														 work_mem,
+														 random());
+
+		StaticAssertDecl(sizeof(LONG_MAX) == sizeof(Datum), "sizeof(LONG_MAX) should be equal to sizeof(Datum)");
+		StaticAssertDecl(sizeof(LONG_MIN) == sizeof(Datum), "sizeof(LONG_MIN) should be equal to sizeof(Datum)");
+		attr_filter->min    = LONG_MAX;
+		attr_filter->max    = LONG_MIN;
+	}
 }

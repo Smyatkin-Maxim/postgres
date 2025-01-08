@@ -41,6 +41,7 @@
 #include "utils/typcache.h"
 #include "utils/xml.h"
 
+extern bool gp_enable_runtime_filter_pushdown;
 
 /* Hook for plugins to get control in ExplainOneQuery() */
 ExplainOneQuery_hook_type ExplainOneQuery_hook = NULL;
@@ -180,6 +181,9 @@ static void ExplainJSONLineEnding(ExplainState *es);
 static void ExplainYAMLLineStarting(ExplainState *es);
 static void escape_yaml(StringInfo buf, const char *str);
 static SerializeMetrics GetSerializationMetrics(DestReceiver *dest);
+static void show_pushdown_runtime_filter_info(const char *qlabel,
+											  PlanState *planstate,
+											  ExplainState *es);
 
 
 
@@ -2153,6 +2157,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			/* fall through to print additional fields the same as SeqScan */
 			/* FALLTHROUGH */
 		case T_SeqScan:
+			if (gp_enable_runtime_filter_pushdown && IsA(planstate, SeqScanState))
+				show_pushdown_runtime_filter_info("Rows Removed by Pushdown Runtime Filter",
+												  planstate, es);
 		case T_ValuesScan:
 		case T_CteScan:
 		case T_NamedTuplestoreScan:
@@ -3969,6 +3976,24 @@ show_instrumentation_count(const char *qlabel, int which,
 		else
 			ExplainPropertyFloat(qlabel, NULL, 0.0, 0, es);
 	}
+}
+
+/*
+ * If it's EXPLAIN ANALYZE, show instrumentation information with pushdown
+ * runtime filter.
+ */
+static void
+show_pushdown_runtime_filter_info(const char *qlabel,
+								  PlanState *planstate,
+								  ExplainState *es)
+{
+	Assert(gp_enable_runtime_filter_pushdown && IsA(planstate, SeqScanState));
+
+	if (!es->analyze || !planstate->instrument)
+		return;
+
+	if (planstate->instrument->prf_work)
+		ExplainPropertyFloat(qlabel, NULL, planstate->instrument->nfilteredPRF, 0, es);
 }
 
 /*

@@ -34,6 +34,11 @@
 #include "utils/rel.h"
 
 static TupleTableSlot *SeqNext(SeqScanState *node);
+static bool PassByBloomFilter(SeqScanState *node, TupleTableSlot *slot);
+static ScanKey ScanKeyListToArray(List *keys, int *num);
+
+
+extern bool gp_enable_runtime_filter_pushdown;
 
 /* ----------------------------------------------------------------
  *						Scan Support
@@ -64,21 +69,44 @@ SeqNext(SeqScanState *node)
 
 	if (scandesc == NULL)
 	{
+		int nkeys = 0;
+		ScanKey keys = NULL;
+
+		/*
+		 * Just when gp_enable_runtime_filter_pushdown enabled and
+		 * node->filter_in_seqscan is false means scankey need to be pushed to
+		 * AM.
+		 */
+		if (gp_enable_runtime_filter_pushdown && !node->filter_in_seqscan)
+			keys = ScanKeyListToArray(node->filters, &nkeys);
 		/*
 		 * We reach here if the scan is not parallel, or if we're serially
 		 * executing a scan that was planned to be parallel.
 		 */
 		scandesc = table_beginscan(node->ss.ss_currentRelation,
 								   estate->es_snapshot,
-								   0, NULL);
+								   nkeys, keys);
 		node->ss.ss_currentScanDesc = scandesc;
 	}
 
 	/*
 	 * get the next tuple from the table
 	 */
-	if (table_scan_getnextslot(scandesc, direction, slot))
-		return slot;
+	if (node->filters)
+	{
+		while (table_scan_getnextslot(scandesc, direction, slot))
+		{
+			if (!PassByBloomFilter(node, slot))
+				continue;
+
+			return slot;
+		}
+	}
+	else
+	{
+		if (table_scan_getnextslot(scandesc, direction, slot))
+			return slot;
+	}
 	return NULL;
 }
 
@@ -299,4 +327,72 @@ ExecSeqScanInitializeWorker(SeqScanState *node,
 	pscan = shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, false);
 	node->ss.ss_currentScanDesc =
 		table_beginscan_parallel(node->ss.ss_currentRelation, pscan);
+}
+
+/*
+ * Returns true if the element may be in the bloom filter.
+ */
+static bool
+PassByBloomFilter(SeqScanState *node, TupleTableSlot *slot)
+{
+	ScanKey	sk;
+	Datum	val;
+	bool	isnull;
+	ListCell *lc;
+	bloom_filter *blm_filter;
+
+	/*
+	 * Mark that the pushdown runtime filter is actually taking effect.
+	 */
+	if (node->ss.ps.instrument &&
+		!node->ss.ps.instrument->prf_work &&
+		list_length(node->filters))
+		node->ss.ps.instrument->prf_work = true;
+
+	foreach (lc, node->filters)
+	{
+		sk = lfirst(lc);
+		if (sk->sk_flags != SK_BLOOM_FILTER)
+			continue;
+
+		val = slot_getattr(slot, sk->sk_attno, &isnull);
+		if (isnull)
+					continue;
+
+		blm_filter = (bloom_filter *)DatumGetPointer(sk->sk_argument);
+		if (bloom_lacks_element(blm_filter, (unsigned char *)&val, sizeof(Datum)))
+		{
+			InstrCountFilteredPRF(node, 1);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * Convert the list of ScanKey to the array, and append an emtpy ScanKey as
+ * the end flag of the array.
+ */
+static ScanKey
+ScanKeyListToArray(List *keys, int *num)
+{
+	ScanKey sk;
+
+	if (list_length(keys) == 0)
+		return NULL;
+
+	Assert(num);
+	*num = list_length(keys);
+
+	sk = (ScanKey)palloc(sizeof(ScanKeyData) * (*num + 1));
+	for (int i = 0; i < *num; ++i)
+		memcpy(&sk[i], list_nth(keys, i), sizeof(ScanKeyData));
+
+	/*
+	 * SK_EMPYT means the end of the array of the ScanKey
+	 */
+	sk[*num].sk_flags = SK_EMPYT;
+
+	return sk;
 }

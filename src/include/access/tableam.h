@@ -39,6 +39,8 @@ struct SampleScanState;
 struct VacuumParams;
 struct ValidateIndexState;
 
+#define SCAN_SUPPORT_RUNTIME_FILTER       (1 << 1)  /* support runtime filter scan */
+
 /*
  * Bitmask values for the flags argument to the scan_begin callback.
  */
