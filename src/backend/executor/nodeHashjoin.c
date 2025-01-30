@@ -218,7 +218,7 @@ static AttrFilter *CreateAttrFilter(PlanState *target,
 									AttrNumber lattno,
 									AttrNumber rattno,
 									double plan_rows);
-
+static void PushdownRuntimeFilter(HashState *node);
 
 
 bool gp_enable_runtime_filter_pushdown = false;
@@ -438,7 +438,12 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				/* FALL THRU */
 
 			case HJ_NEED_NEW_OUTER:
-
+				if (node->checked_outer == 1000 && ((double)node->matched_outer/(double)node->checked_outer) < 0.65 &&
+					gp_enable_runtime_filter_pushdown && hashNode->filters)
+				{
+					PushdownRuntimeFilter(hashNode);
+				}
+				node->first_match = true;
 				/*
 				 * We don't have an outer tuple, try to get the next one
 				 */
@@ -478,6 +483,8 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 						node->hj_JoinState = HJ_NEED_NEW_BATCH;
 					continue;
 				}
+				else
+					node->checked_outer++;
 
 				econtext->ecxt_outertuple = outerTupleSlot;
 				node->hj_MatchedOuter = false;
@@ -606,8 +613,13 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 					if (node->js.jointype == JOIN_RIGHT_ANTI)
 						continue;
 
-					if (otherqual == NULL || ExecQual(otherqual, econtext))
+					if (otherqual == NULL || ExecQual(otherqual, econtext)) {
+						if (node->first_match) {
+							node->first_match = false;
+							node->matched_outer++;
+						}
 						return ExecProject(node->js.ps.ps_ProjInfo);
+					}
 					else
 						InstrCountFiltered2(node, 1);
 				}
@@ -780,6 +792,9 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	outerDesc = ExecGetResultType(outerPlanState(hjstate));
 	innerPlanState(hjstate) = ExecInitNode((Plan *) hashNode, estate, eflags);
 	innerDesc = ExecGetResultType(innerPlanState(hjstate));
+
+	hjstate->matched_outer = 0;
+	hjstate->checked_outer = 0;
 
 	/*
 	 * Initialize result slot, type and projection.
@@ -2077,4 +2092,55 @@ CreateAttrFilter(PlanState *target, AttrNumber lattno, AttrNumber rattno,
 	attr_filter->max = LONG_MIN;
 
 	return attr_filter;
+}
+
+/*
+ * Convert AttrFilter to ScanKeyData and send these runtime filters to the
+ * target node(seqscan).
+ */
+void
+PushdownRuntimeFilter(HashState *node)
+{
+	ListCell	*lc;
+	List		*scankeys;
+	ScanKey		sk;
+	AttrFilter	*attr_filter;
+
+	foreach (lc, node->filters)
+	{
+		scankeys = NIL;
+
+		attr_filter = lfirst(lc);
+		if (!IsA(attr_filter->target, SeqScanState) || attr_filter->empty)
+			continue;
+
+		/* bloom filter */
+		sk = (ScanKey)palloc0(sizeof(ScanKeyData));
+		sk->sk_flags    = SK_BLOOM_FILTER;
+		sk->sk_attno    = attr_filter->lattno;
+		sk->sk_subtype  = INT8OID;
+		sk->sk_argument = PointerGetDatum(attr_filter->blm_filter);
+		scankeys = lappend(scankeys, sk);
+
+		/* range filter */
+		sk = (ScanKey)palloc0(sizeof(ScanKeyData));
+		sk->sk_flags    = 0;
+		sk->sk_attno    = attr_filter->lattno;
+		sk->sk_strategy = BTGreaterEqualStrategyNumber;
+		sk->sk_subtype  = INT8OID;
+		sk->sk_argument = attr_filter->min;
+		scankeys = lappend(scankeys, sk);
+
+		sk = (ScanKey)palloc0(sizeof(ScanKeyData));
+		sk->sk_flags    = 0;
+		sk->sk_attno    = attr_filter->lattno;
+		sk->sk_strategy = BTLessEqualStrategyNumber;
+		sk->sk_subtype  = INT8OID;
+		sk->sk_argument = attr_filter->max;
+		scankeys = lappend(scankeys, sk);
+
+		/* append new runtime filters to target node */
+		SeqScanState *sss = castNode(SeqScanState, attr_filter->target);
+		sss->filters = list_concat(sss->filters, scankeys);
+			}
 }

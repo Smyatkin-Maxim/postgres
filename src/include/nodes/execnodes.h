@@ -2258,6 +2258,9 @@ typedef struct HashJoinState
 	int			hj_JoinState;
 	bool		hj_MatchedOuter;
 	bool		hj_OuterNotEmpty;
+	int matched_outer;
+	int checked_outer;
+	bool first_match;
 } HashJoinState;
 
 

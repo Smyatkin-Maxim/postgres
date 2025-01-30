@@ -73,13 +73,6 @@ SeqNext(SeqScanState *node)
 		ScanKey keys = NULL;
 
 		/*
-		 * Just when gp_enable_runtime_filter_pushdown enabled and
-		 * node->filter_in_seqscan is false means scankey need to be pushed to
-		 * AM.
-		 */
-		if (gp_enable_runtime_filter_pushdown && !node->filter_in_seqscan)
-			keys = ScanKeyListToArray(node->filters, &nkeys);
-		/*
 		 * We reach here if the scan is not parallel, or if we're serially
 		 * executing a scan that was planned to be parallel.
 		 */
